@@ -51,6 +51,9 @@ dependencies = [
     # the rest of the server already uses requests via the myfitnesspal session,
     # but declare it explicitly rather than relying on that transitive edge.
     "requests>=2.28.0",
+    # mfp_search_food parses the web search HTML with lxml (unit-aware energy,
+    # kJ-safe). lxml already arrives via myfitnesspal, but we import it directly.
+    "lxml>=4.9.0",
 ]
 
 [project.optional-dependencies]
