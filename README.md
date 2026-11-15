@@ -720,14 +720,20 @@ Get detailed nutrition for a food item.
 ### mfp_add_food_to_diary
 Add a food item to your diary for a specific meal and date.
 - `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
-- `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
+- `meal` (optional): Meal to log under (default: "Breakfast"). Matched case-insensitively against the account's own meals — the defaults (Breakfast, Lunch, Dinner, Snacks), renamed or localized ones, and custom meals — and posted with the account's exact spelling. A name that matches none of them is rejected with the list of valid meals, because MyFitnessPal would otherwise file the entry under the first meal without an error. Use `mfp_list_meals` to see the account's meals.
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `quantity` (optional): Number of servings (default: 1.0)
 - `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
 
+The first call reads the diary page once to learn the account's meal names (cached for a few minutes).
+
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
+### mfp_list_meals
+List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.
+- `response_format`: "markdown" or "json"
 
 ### mfp_quick_add
 Quick Add raw calories (and optional carbs/protein/fat) with no food lookup — the equivalent of MyFitnessPal's "Quick Add". Use it to log an energy/macro total directly when you don't have or don't need a specific food (a rough restaurant meal, a ride-fuel total). The entry is backed by a throwaway food that's deleted after logging, so it doesn't clutter your food list (the entry keeps its own nutrition — the same way MFP's own Quick Add works).
