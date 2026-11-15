@@ -695,7 +695,7 @@ List a day's individual food entries, one record per logged food, with the times
 - `date` (optional): YYYY-MM-DD format, defaults to today
 - `response_format`: "markdown" or "json"
 
-Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros, and four time fields:
+Each entry has `id`, `meal`, `name`, `brand`, `quantity`, `unit`, `energy`, `energy_unit`, macros (plus `fiber`, `sodium`, `sugar`), and four time fields. The `id` is the entry's v2 diary id: pass it as `entry_id` to `mfp_remove_food_from_diary` to delete exactly that entry.
 
 | Field | Example | Meaning |
 |-------|---------|---------|
@@ -712,6 +712,10 @@ Search the MyFitnessPal food database.
 - `limit` (optional): Max results (default 10, max 50)
 - `response_format`: "markdown" or "json"
 
+Each result has `mfp_id`, `name`, `brand`, `calories`, `energy`, `energy_unit` and `verified`. `calories` is always kcal. `energy` and `energy_unit` (`calories` or `kilojoules`) carry the value the way the account displays it, so on a kilojoule account `energy` is the kJ figure and `calories` is that figure converted.
+
+**Changed from earlier versions:** results no longer include `serving` (it cost one extra request per result; `mfp_get_food_details` returns the serving sizes), and they add `energy`, `energy_unit` and `verified`. A search made with an expired session now returns an error instead of `count: 0`.
+
 ### mfp_get_food_details
 Get detailed nutrition for a food item.
 - `mfp_id` (required): MyFitnessPal food ID from search results
@@ -720,19 +724,25 @@ Get detailed nutrition for a food item.
 ### mfp_add_food_to_diary
 Add a food item to your diary for a specific meal and date.
 - `mfp_id` (required): MyFitnessPal food ID from search results (use `mfp_search_food` first)
-- `meal` (optional): Meal name - "Breakfast", "Lunch", "Dinner", or "Snacks" (default: "Breakfast")
+- `meal` (optional): Meal to log under (default: "Breakfast"). Matched case-insensitively against the account's own meals — the defaults (Breakfast, Lunch, Dinner, Snacks), renamed or localized ones, and custom meals — and posted with the account's exact spelling. A name that matches none of them is rejected with the list of valid meals, because MyFitnessPal would otherwise file the entry under the first meal without an error. Use `mfp_list_meals` to see the account's meals.
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `quantity` (optional): Number of servings (default: 1.0)
 - `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
+
+The first call reads the diary page once to learn the account's meal names (cached for a few minutes).
 
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
 
+### mfp_list_meals
+List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.
+- `response_format`: "markdown" or "json"
+
 ### mfp_quick_add
 Quick Add raw calories (and optional carbs/protein/fat) with no food lookup — the equivalent of MyFitnessPal's "Quick Add". Use it to log an energy/macro total directly when you don't have or don't need a specific food (a rough restaurant meal, a ride-fuel total). The entry is backed by a throwaway food that's deleted after logging, so it doesn't clutter your food list (the entry keeps its own nutrition — the same way MFP's own Quick Add works).
 - `calories` (required): Calories to log
-- `carbohydrates` / `protein` / `fat` (optional): grams
+- `carbohydrates` / `protein` / `fat` (optional): grams (fractions are fine, e.g. `7.5`)
 - `meal` (optional): Meal to log under (see `mfp_list_meals`; default "Breakfast")
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `name` (optional): Label for the entry (default: "Quick Add")
@@ -803,16 +813,18 @@ Get exercise log for a date.
 ### mfp_get_goals
 Get nutrition goals. By default returns the goal that applies on `date` (MyFitnessPal resolves the weekday for you).
 - `date` (optional): YYYY-MM-DD (default today)
-- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium)
+- `all_days` (optional): when true, return the full weekly breakdown — all 7 weekdays plus the default goal — for accounts that set different goals per day (Premium). Each row reports `energy` with its `energy_unit` (`calories` or `kilojoules`, as the account stores it), plus carbs, protein, fat, sodium, sugar and fiber.
 - `response_format`: "markdown" or "json"
 
 ### mfp_set_goals
 Update nutrition goals. Read-modify-write: only the nutrients you pass change; the micronutrient targets, the exercise split, and (when setting one day) the other six days are all preserved.
+
+**Calories on their own rescale the macros.** If `calories` is the only value you pass, carbs, protein and fat are scaled by the same factor (rounded to whole grams), so the macro split is kept and the macros follow the new calories (to within whole-gram rounding) — the same thing MyFitnessPal's goal editor does. Pass any macro explicitly to set exact grams instead; nothing is rescaled then.
 - `calories` (optional): Daily calorie goal
 - `protein` (optional): Daily protein in grams
 - `carbohydrates` (optional): Daily carbs in grams
 - `fat` (optional): Daily fat in grams
-- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values.
+- `day` (optional): weekday to update (e.g. `monday`), for Premium accounts with different goals per day. Omit to set every day of the week (and the default) to the same values. Different goals per weekday are a MyFitnessPal Premium feature: after a per-day write the tool compares what MyFitnessPal saved with what was sent and returns an error if the weekday did not keep the value, rather than reporting success.
 
 ### mfp_get_water
 Get water intake for a date.

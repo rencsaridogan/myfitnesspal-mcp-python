@@ -1059,7 +1059,10 @@ class SetGoalsInput(BaseModel):
 
     calories: Optional[int] = Field(
         default=None,
-        description="Daily calorie goal (e.g., 2000)",
+        description=(
+            "Daily calorie goal (e.g., 2000). Passed on its own, carbs/protein/fat "
+            "are rescaled proportionally to keep the macro split."
+        ),
         ge=500,
         le=10000,
     )
@@ -1086,8 +1089,8 @@ class SetGoalsInput(BaseModel):
         description=(
             "Weekday to update (e.g. 'monday'), for Premium accounts that set "
             "different goals per day. Omit to set the same goal for every day of "
-            "the week (and the default). Only the provided nutrients change; all "
-            "others — including micronutrients and the untouched days — are kept."
+            "the week (and the default). Micronutrients and the untouched days are "
+            "kept. Returns an error if MyFitnessPal does not keep the per-day value."
         ),
     )
 
@@ -1228,15 +1231,15 @@ class QuickAddInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    calories: int = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
-    carbohydrates: Optional[int] = Field(
+    calories: float = Field(..., description="Calories to log (kcal).", ge=1, le=10000)
+    carbohydrates: Optional[float] = Field(
         default=None, description="Carbohydrates in grams (optional).", ge=0, le=2000
     )
-    protein: Optional[int] = Field(
+    protein: Optional[float] = Field(
         default=None, description="Protein in grams (optional).", ge=0, le=2000
     )
-    fat: Optional[int] = Field(
-        default=None, description="Fat in grams (optional).", ge=0, le=2000
+    fat: Optional[float] = Field(
+        default=None, description="Fat in grams (optional, e.g. 7.5).", ge=0, le=2000
     )
     meal: str = Field(
         default="Breakfast",
@@ -1730,31 +1733,73 @@ _MEAL_NAMES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
 _MEAL_NAMES_TTL = 300.0
 
 
+def _scrape_meal_names(client, target_date: date) -> List[str]:
+    """Read the diary page's meal headers exactly as the account spells them.
+
+    python-myfitnesspal reads the same `tr.meal_header` rows but lowercases the
+    text. The diary POST should carry the account's own spelling rather than
+    lean on MyFitnessPal matching case-insensitively, so read them directly.
+    """
+    import lxml.html
+
+    response = client.session.get(
+        f"{MFP_WEB_BASE}/food/diary",
+        params={"date": target_date.strftime("%Y-%m-%d")},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not load the diary page to read meal names: HTTP {response.status_code}"
+        )
+    # An expired session is redirected to the login page, which is still a 200.
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the diary page to its login page: the session "
+            "has expired or is not authenticated. Run refresh_browser_cookies and "
+            "try again."
+        )
+    document = lxml.html.document_fromstring(
+        response.content.decode("utf-8", errors="replace")
+    )
+    names: List[str] = []
+    for cell in document.xpath("//tr[@class='meal_header']/td[1]"):
+        # The whole cell's text (not just its first text node, which would skip
+        # a name wrapped in a child element), with runs of whitespace —
+        # including non-breaking spaces — collapsed to single spaces.
+        name = " ".join(cell.text_content().split())
+        if name:
+            names.append(name)
+    return names
+
+
 def get_meal_names(client, target_date: Optional[date] = None, use_cache: bool = True) -> List[str]:
-    """Return the account's configured meal names, in diary order.
+    """Return the account's configured meal names, in diary order, spelled the
+    way the account defines them (e.g. 'Breakfast', or a custom 'During Ride').
 
     MFP exposes no v2 endpoint for the meal list, so the diary page is the only
     source (the same one mfp_get_diary reads). It reads a single day — the
-    configured meals are account-level and identical across days. The underlying
-    library lowercases the names (e.g. 'breakfast', plus custom meals such as
-    'during ride'); that lowercased form is what the diary POST accepts. Cached
-    per user for a few minutes so bulk logging doesn't re-scrape.
+    configured meals are account-level and identical across days.
+
+    Cost: this is one extra HTML request, and it sits on the write path — the
+    first mfp_add_food_to_diary call fetches the diary page before posting. The
+    result is cached per user for a few minutes so bulk logging doesn't re-fetch.
+    An empty result (e.g. an expired session returning a login page) is never
+    cached, so the next call retries instead of failing for the whole TTL.
     """
     key = str(getattr(client, "user_id", "") or "")
     if use_cache and key:
         cached = _MEAL_NAMES_CACHE.get(key)
         if cached and cached[0] > time.time():
             return cached[1]
-    day = client.get_date(target_date or date.today())
-    names = [meal.name for meal in day.meals]
-    if key:
+    names = _scrape_meal_names(client, target_date or date.today())
+    if key and names:
         _MEAL_NAMES_CACHE[key] = (time.time() + _MEAL_NAMES_TTL, names)
     return names
 
 
 def _resolve_meal(meal: str, meal_names: List[str]) -> str:
     """Match `meal` to one of the account's configured meals (case-insensitive)
-    and return the account's own name for it (lowercased, as MFP lists it).
+    and return the account's own spelling of it, which is what gets posted.
 
     MFP's diary POST silently files an unrecognized meal_name under a default
     meal (observed: the first one) instead of erroring, so entries get mis-logged
@@ -1766,12 +1811,13 @@ def _resolve_meal(meal: str, meal_names: List[str]) -> str:
             "Could not read this account's meals from MyFitnessPal, so the entry "
             "can't be placed safely. Try again, or check mfp_get_diary."
         )
-    wanted = (meal or "").strip().lower()
-    by_name = {name.strip().lower(): name for name in meal_names}
+    wanted = (meal or "").strip().casefold()
+    by_name = {name.strip().casefold(): name for name in meal_names}
     if wanted in by_name:
         return by_name[wanted]
     # Tolerate a singular/plural slip (e.g. "snack" -> "snacks"), language-neutral.
-    alternates = {wanted + "s"}
+    # Not for an empty name: "" + "s" must not match a meal called "S".
+    alternates = {wanted + "s"} if wanted else set()
     if wanted.endswith("s"):
         alternates.add(wanted[:-1])
     for alt in alternates:
@@ -1856,12 +1902,12 @@ def add_food_to_diary(
 def quick_add_to_diary(
     client,
     *,
-    calories: int,
+    calories: float,
     meal: str,
     target_date: date,
-    carbohydrates: Optional[int] = None,
-    protein: Optional[int] = None,
-    fat: Optional[int] = None,
+    carbohydrates: Optional[float] = None,
+    protein: Optional[float] = None,
+    fat: Optional[float] = None,
     name: str = "Quick Add",
 ) -> Tuple[Optional[str], str]:
     """
@@ -1886,7 +1932,6 @@ def quick_add_to_diary(
         "calories": calories,
         "serving_amount": 1,
         "serving_unit": "serving",
-        "country_code": "NL",
     }
     if carbohydrates is not None:
         spec["carbs"] = carbohydrates
@@ -2209,6 +2254,10 @@ def _parse_search_energy(text: Optional[str]) -> Tuple[Optional[float], Optional
     return value, ("kilojoules" if u.startswith("kilojoule") or u == "kj" else "calories")
 
 
+# A comma that separates fields: any comma except one between two digits.
+_SEARCH_FIELD_COMMA_RE = re.compile(r"(?<!\d),|,(?!\d)")
+
+
 def _parse_search_brand(text: Optional[str]) -> str:
     """Brand from a search info line '<brand…>, <serving>, <energy>'. The energy
     token is stripped first so a thousands separator in it can't shift the
@@ -2218,9 +2267,65 @@ def _parse_search_brand(text: Optional[str]) -> str:
     head = text
     for match in _SEARCH_ENERGY_RE.finditer(text):
         head = text[: match.start()]  # keep trimming to the last energy token
-    parts = [p.strip() for p in head.split(",") if p.strip()]
+    # Split on the field commas, not on a thousands separator inside the serving
+    # ("0.5 cup (1,000 g)").
+    parts = [p.strip() for p in _SEARCH_FIELD_COMMA_RE.split(head) if p.strip()]
     # The last remaining field is the serving; the brand is everything before it.
-    return " ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
+    # Rejoin with ", " so a brand that itself contains a comma ("Foo, Inc.")
+    # reads as written rather than losing it. The line gives no way to tell a
+    # comma in the brand from one in the serving, so a serving written with a
+    # comma ("1 cup, chopped") still leaks its first half into the brand — the
+    # same limit python-myfitnesspal's parser has.
+    return ", ".join(parts[:-1]).strip() if len(parts) >= 2 else ""
+
+
+# 1 kcal = 4.184 kJ (the factor MyFitnessPal's own web client uses).
+_SEARCH_KJ_PER_KCAL = 4.184
+
+
+def _energy_as_kcal(value: Optional[float], unit: Optional[str]) -> Optional[float]:
+    """Energy expressed in kcal whatever the account's unit, for the `calories`
+    field older callers read. None when the row had no energy."""
+    if value is None:
+        return None
+    if unit == "kilojoules":
+        return round(value / _SEARCH_KJ_PER_KCAL, 1)
+    return value
+
+
+def _raise_if_login_page(response) -> None:
+    """Raise a clear auth error when MyFitnessPal answered with its login page.
+
+    An expired or missing session is redirected (302) to /account/login, which
+    still comes back as HTTP 200. Neither the status code nor the text
+    "Matching Foods:" tells that apart from a search with no matches: the login
+    page ships the site's translation bundle, which contains that very string.
+    The final URL does (observed live, 2026-11-15). Without this, a dead
+    session reads as "0 results" rather than as an auth failure.
+    """
+    if "/account/login" in str(getattr(response, "url", "") or ""):
+        raise RuntimeError(
+            "MyFitnessPal redirected the food search to its login page: the "
+            "session has expired or is not authenticated. Run "
+            "refresh_browser_cookies and try again."
+        )
+
+
+def _has_search_results_section(document) -> bool:
+    """True when the page carries the search-results scaffold, which MFP renders
+    even for zero matches (an `#sort-block` holding the "Matching Foods:"
+    heading). Either marker is enough: the id does not depend on the account's
+    language, the heading does not depend on the id. Text that is not rendered
+    as page content (scripts, styles, templates, the title…) is ignored so a
+    translation bundle can't pass for the heading."""
+    return bool(
+        document.xpath(
+            "//*[@id='sort-block'] | "
+            "//*[not(self::script or self::style or self::noscript or self::template"
+            " or self::title or self::textarea)]"
+            "/text()[contains(., 'Matching Foods:')]"
+        )
+    )
 
 
 def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -2228,7 +2333,12 @@ def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
 
     Replicates the web search request python-myfitnesspal makes (GET the form for
     its CSRF token, POST the query), then parses the result list ourselves.
-    Returns up to `limit` items: id, name, brand, energy, energy_unit, verified.
+    Returns up to `limit` items: id, name, brand, calories (kcal), energy,
+    energy_unit, verified.
+
+    Raises:
+        RuntimeError: on an HTTP error, when the session is redirected to the
+            login page, or when the response is not a search-results page.
     """
     import lxml.html
 
@@ -2236,6 +2346,7 @@ def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
     page = client.session.get(search_url, timeout=30)
     if page.status_code != 200:
         raise RuntimeError(f"Could not load the food-search page: HTTP {page.status_code}")
+    _raise_if_login_page(page)
     form = lxml.html.document_fromstring(page.content.decode("utf-8", errors="replace"))
     tokens = form.xpath("(//input[@name='authenticity_token']/@value)[1]")
     if not tokens:
@@ -2251,13 +2362,21 @@ def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
         },
         timeout=30,
     )
-    # A 200 with no matches is an empty result set, not an error -> return [].
     if response.status_code != 200:
         raise RuntimeError(f"Food search request failed: HTTP {response.status_code}")
+    _raise_if_login_page(response)
 
     document = lxml.html.document_fromstring(response.content.decode("utf-8", errors="replace"))
+    items = document.xpath("//li[@class='matched-food']")
+    # A results page with no matches is an empty result set -> return []. Any
+    # other 200 without results is not: say so instead of reporting 0 foods.
+    if not items and not _has_search_results_section(document):
+        raise RuntimeError(
+            "MyFitnessPal did not return a search-results page (no results "
+            "section found); the session may have expired."
+        )
     results: List[Dict[str, Any]] = []
-    for item in document.xpath("//li[@class='matched-food']"):
+    for item in items:
         anchors = item.xpath(".//div[@class='search-title-container']/a")
         if not anchors:
             continue
@@ -2269,6 +2388,10 @@ def search_food(client, query: str, limit: int) -> List[Dict[str, Any]]:
             "mfp_id": anchor.get("data-external-id"),
             "name": (anchor.text or "").strip(),
             "brand": _parse_search_brand(info_text),
+            # `calories` is always kcal (converted on kilojoule accounts), kept
+            # for callers of the previous schema; energy/energy_unit carry the
+            # value exactly as the account displays it.
+            "calories": _energy_as_kcal(energy, energy_unit),
             "energy": energy,
             "energy_unit": energy_unit,
             # whole-word 'verified' so a 'unverified' class can't false-positive
@@ -2295,12 +2418,14 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     Search the MyFitnessPal food database for food items.
 
-    Returns matching foods with name, brand, energy (and its unit — 'calories'
-    or 'kilojoules', per the account's setting), a verified flag, and the MFP ID.
-    Pass the id to mfp_get_food_details for full nutrition and serving sizes.
+    Returns matching foods with name, brand, calories (always kcal), energy and
+    its unit ('calories' or 'kilojoules', as the account displays it), a
+    verified flag, and the MFP ID. Pass the id to mfp_get_food_details for full
+    nutrition and serving sizes.
 
     Energy is parsed unit-aware, so kilojoule accounts (AU/NZ) work too rather
-    than erroring.
+    than erroring. An expired session is reported as an error, not as zero
+    results.
 
     Args:
         params: SearchFoodInput containing:
@@ -2309,7 +2434,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
             - response_format (str): 'markdown' or 'json'
 
     Returns:
-        str: Matching foods — id, name, brand, energy, energy_unit, verified
+        str: Matching foods — id, name, brand, calories, energy, energy_unit, verified
     """
     try:
         client = get_mfp_client()
@@ -2642,21 +2767,39 @@ def fetch_nutrient_goals(client, on_date: Optional[date] = None) -> Dict[str, An
     return items[0]
 
 
+_GOAL_MACROS = ("carbohydrates", "protein", "fat")
+
+
 def _apply_one_goal(goal: Dict[str, Any], overrides: Dict[str, int]) -> None:
     """Mutate a single goal dict in place with the provided nutrient values.
 
-    Only the keys present in `overrides` are touched. `calories` (always kcal)
-    maps to the nested energy.value, converted to kilojoules when the stored
-    goal is in kJ so the account's unit is preserved.
+    `calories` (always kcal) maps to the nested energy.value, converted to
+    kilojoules when the stored goal is in kJ so the account's unit is preserved.
+
+    Calories-only update: when `calories` is the only override, the three macro
+    gram targets are rescaled by the same factor as the energy (rounded to whole
+    grams), so the macro split is kept and the macros follow the new energy (to
+    within that rounding). That is what MyFitnessPal's own goal editor does, and
+    what this tool
+    did while it delegated to python-myfitnesspal's `set_new_goal`. Passing any
+    macro explicitly turns the rescale off: the given values are written as-is
+    and the other macros are left alone. Micronutrients are never rescaled.
     """
     if "calories" in overrides:
-        energy = goal.setdefault("energy", {})
+        energy = goal.get("energy") or {}
+        goal["energy"] = energy
+        old_value = energy.get("value")
         value: float = overrides["calories"]
         if energy.get("unit") == "kilojoules":
             value = round(value * _KJ_PER_KCAL)
         energy["value"] = value
         energy.setdefault("unit", "calories")
-    for key in ("protein", "carbohydrates", "fat"):
+        if old_value and not any(key in overrides for key in _GOAL_MACROS):
+            ratio = value / old_value
+            for key in _GOAL_MACROS:
+                if goal.get(key) is not None:
+                    goal[key] = round(goal[key] * ratio)
+    for key in _GOAL_MACROS:
         if key in overrides:
             goal[key] = overrides[key]
 
@@ -2675,8 +2818,10 @@ def build_nutrient_goals_payload(
     - day set: apply only to that weekday; default_goal and other days untouched.
 
     Every field not in `overrides` — the other days, micronutrients, exercise
-    split percentages — is carried forward unchanged. Server-computed fields are
-    stripped and valid_from is set to today so the goal takes effect immediately.
+    split percentages, any `meal_goals` — is carried forward unchanged (the one
+    exception is the calories-only macro rescale, see `_apply_one_goal`).
+    Server-computed fields are stripped and valid_from is set to today so the
+    goal takes effect immediately.
 
     Raises:
         RuntimeError: If `day` is given but absent from the weekly goals.
@@ -2714,6 +2859,61 @@ def build_nutrient_goals_payload(
     return {"item": item}
 
 
+def _goal_numbers(goal: Dict[str, Any]) -> Dict[str, Any]:
+    """The energy value and macro grams of one goal, for comparing two copies."""
+    numbers: Dict[str, Any] = {"energy": (goal.get("energy") or {}).get("value")}
+    for key in _GOAL_MACROS:
+        numbers[key] = goal.get(key)
+    return numbers
+
+
+def _check_day_was_kept(
+    day: str, sent_item: Dict[str, Any], saved_item: Dict[str, Any]
+) -> None:
+    """Raise if MyFitnessPal's saved week is not the week that was sent.
+
+    Different goals per weekday are a Premium feature. What a free account does
+    with a per-day write (reject it, ignore it, or flatten the week to one
+    value) has not been observed, so rather than assume, compare what came
+    back: every weekday — the one being set and the six carried forward — must
+    hold the energy, energy unit and macros that were sent. If not, say so
+    instead of reporting success. On Premium the saved item echoes the sent
+    values exactly (verified live).
+
+    By the time this runs the write has been accepted, so the error says the
+    stored goals may have changed rather than implying nothing happened.
+    """
+
+    def by_day(item: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {g.get("day_of_week"): g for g in item.get("daily_goals", [])}
+
+    sent_days, saved_days = by_day(sent_item), by_day(saved_item)
+    differing: List[str] = []
+    # The requested day first, so it leads the message.
+    for name in sorted(sent_days, key=lambda n: n != day):
+        sent_goal, saved_goal = sent_days[name], saved_days.get(name) or {}
+        want, got = _goal_numbers(sent_goal), _goal_numbers(saved_goal)
+        for key, value in want.items():
+            if value is None:
+                continue
+            if got.get(key) is None or abs(float(got[key]) - float(value)) > 0.5:
+                differing.append(
+                    f"{name} {key}: sent {_fmt_num(value)}, saved {_fmt_num(got.get(key))}"
+                )
+        sent_unit = (sent_goal.get("energy") or {}).get("unit")
+        saved_unit = (saved_goal.get("energy") or {}).get("unit")
+        if sent_unit and saved_unit and sent_unit != saved_unit:
+            differing.append(f"{name} energy unit: sent {sent_unit}, saved {saved_unit}")
+    if differing:
+        raise RuntimeError(
+            f"MyFitnessPal accepted the write but did not keep the {day} goal as sent "
+            f"({'; '.join(differing)}). Different goals per weekday need MyFitnessPal "
+            "Premium; without it a per-day value is ignored or overridden. The stored "
+            "goals may have changed: check them with mfp_get_goals (all_days=true). "
+            "Omit `day` to set the whole week."
+        )
+
+
 def set_nutrient_goals(
     client, *, day: Optional[str], overrides: Dict[str, int]
 ) -> Dict[str, Any]:
@@ -2722,7 +2922,9 @@ def set_nutrient_goals(
     POST the result back. Returns the saved goal item.
 
     Raises:
-        RuntimeError: If the read or write fails.
+        RuntimeError: If the read or write fails, or if a per-day write did not
+            stick (the saved weekday differs from what was sent — see
+            `_check_day_was_kept`).
     """
     current = fetch_nutrient_goals(client)
     payload = build_nutrient_goals_payload(current, day=day, overrides=overrides)
@@ -2741,14 +2943,21 @@ def set_nutrient_goals(
         )
     body = response.json()
     # POST echoes {"item": {...saved...}}; re-read if a client ever omits it.
-    return body.get("item") or fetch_nutrient_goals(client)
+    saved = body.get("item") or fetch_nutrient_goals(client)
+    if day is not None:
+        _check_day_was_kept(day, payload["item"], saved)
+    return saved
 
 
 def _goal_row(goal: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact nutrient view of one goal (day or default). Pure."""
+    """Compact nutrient view of one goal (day or default). Pure.
+
+    The energy is reported as stored, under `energy` with its `energy_unit`
+    beside it — not under `calories`, which would mislabel a kilojoule account.
+    """
     energy = goal.get("energy") or {}
     return {
-        "calories": energy.get("value"),
+        "energy": energy.get("value"),
         "energy_unit": energy.get("unit"),
         "carbohydrates": goal.get("carbohydrates"),
         "protein": goal.get("protein"),
@@ -2778,9 +2987,9 @@ def _fmt_num(n: Any) -> str:
 
 def _goal_row_line(row: Dict[str, Any]) -> str:
     """One compact human line for a goal row (day or default). Pure."""
-    cal = row.get("calories")
-    unit = row.get("energy_unit") or "cal"
-    parts = [f"{_fmt_num(cal)} {unit}" if cal is not None else "no energy"]
+    energy = row.get("energy")
+    unit = row.get("energy_unit") or "calories"
+    parts = [f"{_fmt_num(energy)} {unit}" if energy is not None else "no energy"]
     macros = " / ".join(
         f"{_fmt_num(row.get(k))}{abbr}"
         for k, abbr in (("carbohydrates", "C"), ("protein", "P"), ("fat", "F"))
@@ -2846,7 +3055,7 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
                 return _goals_week_markdown(str(target_date), summary)
             return json.dumps({"date": str(target_date), **summary}, indent=2)
 
-        day = client.get_date(target_date)
+        day = await asyncio.to_thread(client.get_date, target_date)
         data = {"date": str(target_date), "goals": day.goals}
 
         return format_response(data, params.response_format, "Daily Nutrition Goals")
@@ -2874,9 +3083,16 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     other six days. This is a read-modify-write of MyFitnessPal's weekly goal,
     so nothing you leave out is lost.
 
+    One deliberate exception: if `calories` is the only value you pass, carbs,
+    protein and fat are rescaled by the same factor so the macro split is kept
+    and the macros follow the new calories (to within whole-gram rounding).
+    Pass any macro explicitly to set exact grams instead (no rescaling then).
+
     Pass `day` (e.g. 'monday') to change just that weekday — for Premium
     accounts that run different goals per day. Omit `day` to set every day of
-    the week (and the default) to the same values.
+    the week (and the default) to the same values. If MyFitnessPal does not
+    keep a per-day value (per-day goals need Premium), the tool returns an
+    error rather than reporting success.
 
     Args:
         params: SetGoalsInput containing:
@@ -3116,7 +3332,7 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
 # this payload: created_at matched the app for one such entry and was over
 # two hours later for another, so the fields are passed through as-is and
 # never substituted for each other.
-_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "sodium", "sugar")
+_ENTRY_NUTRIENTS = ("carbohydrates", "fat", "protein", "fiber", "sodium", "sugar")
 
 
 def _round_or_none(value: Optional[float]) -> Optional[float]:
@@ -3352,8 +3568,8 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
 
     Args:
         params: QuickAddInput containing:
-            - calories (int): calories to log (required)
-            - carbohydrates / protein / fat (int, optional): grams
+            - calories (float): calories to log (required)
+            - carbohydrates / protein / fat (float, optional): grams
             - meal (str): meal to log under (see mfp_list_meals); default Breakfast
             - date (str, optional): YYYY-MM-DD, defaults to today
             - name (str): label for the entry (default 'Quick Add')
@@ -3380,7 +3596,7 @@ async def mfp_quick_add(params: QuickAddInput) -> str:
         return json.dumps(
             {
                 "success": True,
-                "message": f"Quick-added {params.calories} cal to {resolved_meal}",
+                "message": f"Quick-added {params.calories:g} cal to {resolved_meal}",
                 "entry_id": entry_id,
                 "date": str(target_date),
                 "meal": resolved_meal,
@@ -3425,7 +3641,7 @@ async def mfp_list_meals(params: ListMealsInput) -> str:
 
     These are the values mfp_add_food_to_diary accepts for `meal`. The defaults
     are Breakfast/Lunch/Dinner/Snacks, but an account may have renamed them
-    (localized) or added custom meals (e.g. 'supplements', 'during ride'). Pass
+    (localized) or added custom meals (e.g. 'Supplements', 'During Ride'). Pass
     one of these names (case-insensitive) when logging, so entries aren't
     rejected or silently misfiled under the wrong meal.
 
@@ -3438,6 +3654,14 @@ async def mfp_list_meals(params: ListMealsInput) -> str:
     try:
         client = get_mfp_client()
         names = await asyncio.to_thread(get_meal_names, client, None)
+        if not names:
+            message = (
+                "No meals found: MyFitnessPal's diary page returned no meal "
+                "headers (the session may have expired — try refresh_browser_cookies)."
+            )
+            if params.response_format == ResponseFormat.MARKDOWN:
+                return f"## Meals\n{message}"
+            return json.dumps({"meals": [], "message": message}, indent=2)
         if params.response_format == ResponseFormat.MARKDOWN:
             return "## Meals\n" + "\n".join(f"- {n}" for n in names)
         return json.dumps({"meals": names}, indent=2)
@@ -3716,8 +3940,8 @@ def refresh_browser_cookies(browser: str = "auto") -> str:
                  - 'auto' (default): scan every installed Chromium-based
                    browser on macOS (Arc, Dia, Chrome, Edge, Brave, Vivaldi,
                    Opera, ...) and use the first one with a valid session.
-                 - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
-                   'opera': force a specific Chromium browser (macOS).
+                 - 'arc', 'dia', 'chrome', 'chromium', 'edge', 'brave',
+                   'vivaldi', 'opera': force a specific Chromium browser (macOS).
                  - 'firefox': use browser_cookie3 (Firefox is not Chromium).
 
     Returns:
@@ -4311,7 +4535,9 @@ async def mfp_get_fasts(params: GetFastsInput) -> str:
             try:
                 raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             except mobile_sync.Unauthorized:
-                token = mobile_sync.get_mobile_access_token(force_refresh=True, session=session)
+                token = mobile_sync.get_mobile_access_token(
+                    force_refresh=True, session=session, rejected=token
+                )
                 raw, _sync = mobile_sync.fetch_all_fasts(token, session=session)
             return raw
 
