@@ -42,6 +42,12 @@ class _Session:
         self.calls.append(("POST", url, json.loads(data)))
         return _Response(201, {"items": [{"id": "e-1"}]})
 
+    def get(self, url, params=None, **kwargs):
+        self.calls.append(("GET", url, params))
+        return _Response(200, {"items": [
+            {"type": "food_entry", "id": "abc", "meal_name": "Breakfast"},
+        ]})
+
     def patch(self, url, data=None, **kwargs):
         self.calls.append(("PATCH", url, json.loads(data)))
         return _Response(self.status)
@@ -69,18 +75,28 @@ def test_add_without_time_sends_no_consumed_at(client):
     assert "consumed_at" not in body["items"][0]
 
 
-def test_set_entry_time_patches_only_consumed_at(client):
-    server.set_entry_time(client, "abc", "13:30")
-    method, url, body = client.session.calls[0]
+D = date(2026, 11, 21)
+
+
+def test_set_entry_time_keeps_the_meal(client):
+    """A PATCH with consumed_at alone moved Breakfast to Lunch live; the meal goes with it."""
+    assert server.set_entry_time(client, "abc", "13:30", D) == "Breakfast"
+    method, url, body = client.session.calls[-1]
     assert method == "PATCH"
     assert url.endswith("/v2/diary/abc")
-    assert body == {"item": {"consumed_at": "13:30:00"}}
+    assert body == {"item": {"consumed_at": "13:30:00", "meal_name": "Breakfast"}}
+
+
+def test_set_entry_time_unknown_entry(client):
+    with pytest.raises(RuntimeError, match="not in the diary"):
+        server.set_entry_time(client, "nope", "13:30", D)
+    assert not any(c[0] == "PATCH" for c in client.session.calls)
 
 
 def test_set_entry_time_raises_on_failure(client):
     client.session.status = 404
     with pytest.raises(RuntimeError, match="HTTP 404"):
-        server.set_entry_time(client, "abc", "13:30")
+        server.set_entry_time(client, "abc", "13:30", D)
 
 
 @pytest.mark.parametrize("bad", ["1100", "25:00", "11:60", "9:00", "11:00:00"])
@@ -93,5 +109,7 @@ def test_time_must_be_hh_mm(bad):
 
 def test_tool_reports_success(client, monkeypatch):
     monkeypatch.setattr(server, "get_mfp_client", lambda: client)
-    out = asyncio.run(server.mfp_set_entry_time(server.SetEntryTimeInput(entry_id="abc", time="11:00")))
-    assert json.loads(out) == {"success": True, "entry_id": "abc", "time": "11:00"}
+    out = asyncio.run(server.mfp_set_entry_time(
+        server.SetEntryTimeInput(entry_id="abc", time="11:00", date="2026-11-21")))
+    assert json.loads(out) == {"success": True, "entry_id": "abc", "date": "2026-11-21",
+                               "time": "11:00", "meal": "Breakfast"}

@@ -1253,6 +1253,11 @@ class SetEntryTimeInput(BaseModel):
         description="Time of day the food was eaten, 24-hour 'HH:MM' (e.g. '11:00').",
         pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
     )
+    date: Optional[str] = Field(
+        default=None,
+        description="The entry's diary date, YYYY-MM-DD. Defaults to today.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
 
 
 class QuickAddInput(BaseModel):
@@ -1956,24 +1961,41 @@ def _consumed_at(time: str) -> str:
     return f"{time}:00" if len(time) == 5 else time
 
 
-def set_entry_time(client, entry_id: str, time: str) -> None:
+def set_entry_time(client, entry_id: str, time: str, target_date: date) -> str:
     """
-    Set an existing diary entry's eating time (consumed_at).
+    Set an existing diary entry's eating time (consumed_at), keeping its meal.
 
-    PATCH /v2/diary/{id} with {"item": {"consumed_at": "HH:MM:SS"}} answers 204
-    and changes only the time; verified live 2026-11-21 on a test entry.
+    PATCH /v2/diary/{id} answers 204 and changes the time, but a body with only
+    consumed_at also moves the entry to another meal (seen live 2026-11-21:
+    Breakfast became Lunch). So the entry's current meal_name is read from the
+    day's entries and sent with the time; amount and nutrition are untouched.
+
+    Returns:
+        the entry's meal name (unchanged)
+
+    Raises:
+        RuntimeError: the entry is not in that day's diary, or the PATCH failed
     """
+    entry = next((e for e in get_food_entries(client, target_date) if e["id"] == entry_id), None)
+    if entry is None:
+        raise RuntimeError(
+            f"Entry {entry_id} is not in the diary for {target_date}; "
+            "list the day with mfp_get_food_entries for its current id"
+        )
     response = client.session.patch(
         f"{MFP_API_BASE}/v2/diary/{entry_id}",
         headers=_mfp_api_headers(client, json_body=True),
-        data=json.dumps({"item": {"consumed_at": _consumed_at(time)}}),
+        data=json.dumps(
+            {"item": {"consumed_at": _consumed_at(time), "meal_name": entry["meal"]}}
+        ),
         timeout=30,
     )
     if response.status_code not in (200, 204):
         raise RuntimeError(
             f"Could not set the time of entry {entry_id}: HTTP {response.status_code}"
         )
-    logger.info(f"Set entry {entry_id} consumed_at to {time}")
+    logger.info(f"Set entry {entry_id} consumed_at to {time} ({entry['meal']})")
+    return entry["meal"]
 
 
 def quick_add_to_diary(
@@ -3782,15 +3804,25 @@ async def mfp_set_entry_time(params: SetEntryTimeInput) -> str:
         params: SetEntryTimeInput containing:
             - entry_id (str): the entry's v2 diary id (UUID)
             - time (str): 'HH:MM', 24-hour
+            - date (str, optional): the entry's date, YYYY-MM-DD (default today)
 
     Returns:
         str: Confirmation, or the error MyFitnessPal returned
     """
     try:
         client = get_mfp_client()
-        await asyncio.to_thread(set_entry_time, client, params.entry_id, params.time)
+        target_date = parse_date(params.date)
+        meal = await asyncio.to_thread(
+            set_entry_time, client, params.entry_id, params.time, target_date
+        )
         return json.dumps(
-            {"success": True, "entry_id": params.entry_id, "time": params.time},
+            {
+                "success": True,
+                "entry_id": params.entry_id,
+                "date": str(target_date),
+                "time": params.time,
+                "meal": meal,
+            },
             indent=2,
         )
     except Exception as e:

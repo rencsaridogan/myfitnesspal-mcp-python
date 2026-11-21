@@ -738,9 +738,10 @@ The first call reads the diary page once to learn the account's meal names (cach
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
 
 ### mfp_set_entry_time
-Set the time of day an existing diary entry was eaten. Changes only the entry's `consumed_at`; amount, meal and nutrition are untouched (`PATCH /v2/diary/{id}` with `{"item": {"consumed_at": "HH:MM:SS"}}`, which answers 204).
+Set the time of day an existing diary entry was eaten. Changes the entry's `consumed_at`; amount, meal and nutrition stay as they were (`PATCH /v2/diary/{id}` answers 204). The entry's current meal is read first and sent with the time, because a PATCH carrying `consumed_at` alone also moves the entry to another meal.
 - `entry_id` (required): the entry's v2 diary id, as listed by `mfp_get_food_entries`
 - `time` (required): 24-hour `HH:MM`
+- `date` (optional): the entry's date, YYYY-MM-DD (default: today)
 
 ### mfp_list_meals
 List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.
