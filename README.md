@@ -14,6 +14,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_list_meals` | Read | List the account's configured meal names (incl. renamed/custom) for use with `mfp_add_food_to_diary` |
 | `mfp_quick_add` | Write | Quick Add raw calories (+ optional macros) with no food lookup |
 | `mfp_remove_food_from_diary` | Write | Remove a logged entry from your diary |
+| `mfp_set_entry_time` | Write | Set the time an existing diary entry was eaten (`consumed_at`) |
 | `mfp_create_custom_food` | Write | Create a private custom food with a full nutrition panel |
 | `mfp_list_own_foods` | Read | List your own custom foods (private ones do not appear in search) |
 | `mfp_delete_custom_food` | Write | Delete one of your custom foods |
@@ -728,12 +729,18 @@ Add a food item to your diary for a specific meal and date.
 - `date` (optional): YYYY-MM-DD format (default: today)
 - `quantity` (optional): Number of servings (default: 1.0)
 - `unit` (optional): Unit/serving size description (e.g., "1 cup", "100g")
+- `time` (optional): When it was eaten, 24-hour `HH:MM`. Stored as the entry's `consumed_at`, the field the app's time picker sets. Without it MyFitnessPal stores no time for the entry; set one later with `mfp_set_entry_time`.
 
 The first call reads the diary page once to learn the account's meal names (cached for a few minutes).
 
 **Example workflow:**
 1. Use `mfp_search_food` to find a food item and get its `mfp_id`
 2. Use `mfp_add_food_to_diary` with the `mfp_id` to add it to your diary
+
+### mfp_set_entry_time
+Set the time of day an existing diary entry was eaten. Changes only the entry's `consumed_at`; amount, meal and nutrition are untouched (`PATCH /v2/diary/{id}` with `{"item": {"consumed_at": "HH:MM:SS"}}`, which answers 204).
+- `entry_id` (required): the entry's v2 diary id, as listed by `mfp_get_food_entries`
+- `time` (required): 24-hour `HH:MM`
 
 ### mfp_list_meals
 List the account's configured meal names, in diary order and spelled the way the account defines them (for example `Breakfast`, a localized `Almoço`, or a custom `During Ride`). These are the values `mfp_add_food_to_diary` accepts for `meal`.

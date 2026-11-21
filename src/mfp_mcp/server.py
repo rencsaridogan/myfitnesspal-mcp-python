@@ -1224,6 +1224,35 @@ class AddFoodToDiaryInput(BaseModel):
         default=None,
         description="Unit/serving size description (e.g., '1 cup', '100g'). If not provided, uses default serving size from food item.",
     )
+    time: Optional[str] = Field(
+        default=None,
+        description=(
+            "Time of day the food was eaten, 24-hour 'HH:MM' (e.g. '11:00'). Stored as the "
+            "entry's consumed_at, the same field the app's time picker sets. Omit it and "
+            "MyFitnessPal stores no time for the entry."
+        ),
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+
+
+class SetEntryTimeInput(BaseModel):
+    """Input model for setting the time an existing diary entry was eaten."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    entry_id: str = Field(
+        ...,
+        description=(
+            "The entry's v2 diary id (the UUID mfp_add_food_to_diary returns and "
+            "mfp_get_food_entries lists), not a food id."
+        ),
+        min_length=1,
+    )
+    time: str = Field(
+        ...,
+        description="Time of day the food was eaten, 24-hour 'HH:MM' (e.g. '11:00').",
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
 
 
 class QuickAddInput(BaseModel):
@@ -1844,7 +1873,13 @@ def _resolve_meal(meal: str, meal_names: List[str]) -> str:
 
 
 def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
+    client,
+    mfp_id: str,
+    meal: str,
+    target_date: date,
+    quantity: float = 1.0,
+    unit: Optional[str] = None,
+    time: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
     """
     Add a food item to the diary for a specific date and meal.
@@ -1856,6 +1891,7 @@ def add_food_to_diary(
         target_date: Date to add the food entry
         quantity: Number of servings (default 1.0)
         unit: Optional serving unit to log against (e.g. "oz")
+        time: Optional eating time "HH:MM", stored as consumed_at
 
     Returns:
         (entry id or None if MFP returned none, the resolved account meal name)
@@ -1876,6 +1912,8 @@ def add_food_to_diary(
         "food": {"id": str(food["id"]), "version": str(food["version"])},
         "serving_size": serving_size,
     }
+    if time:
+        entry["consumed_at"] = _consumed_at(time)
 
     response = client.session.post(
         f"{MFP_API_BASE}/v2/diary",
@@ -1911,6 +1949,31 @@ def add_food_to_diary(
         logger.warning("Entry created but MyFitnessPal returned no entry id")
         entry_id = None
     return entry_id, meal_name
+
+
+def _consumed_at(time: str) -> str:
+    """'HH:MM' -> the 'HH:MM:SS' form the v2 diary stores in consumed_at."""
+    return f"{time}:00" if len(time) == 5 else time
+
+
+def set_entry_time(client, entry_id: str, time: str) -> None:
+    """
+    Set an existing diary entry's eating time (consumed_at).
+
+    PATCH /v2/diary/{id} with {"item": {"consumed_at": "HH:MM:SS"}} answers 204
+    and changes only the time; verified live 2026-11-21 on a test entry.
+    """
+    response = client.session.patch(
+        f"{MFP_API_BASE}/v2/diary/{entry_id}",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"item": {"consumed_at": _consumed_at(time)}}),
+        timeout=30,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Could not set the time of entry {entry_id}: HTTP {response.status_code}"
+        )
+    logger.info(f"Set entry {entry_id} consumed_at to {time}")
 
 
 def quick_add_to_diary(
@@ -3517,6 +3580,9 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
               Use 0.1 or 1 as a placeholder for meals not yet consumed — update to the real
               weight after eating. Range: (0, 10 000].
             - unit (str, optional): Unit/serving size (e.g., '1 cup', '100g')
+            - time (str, optional): When it was eaten, 'HH:MM'. Pass it whenever the
+              time is known: without it MyFitnessPal stores no time for the entry.
+              Fix a missing or wrong time later with mfp_set_entry_time.
 
     Returns:
         str: Confirmation message with details of the added food entry
@@ -3534,6 +3600,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 target_date=target_date,
                 quantity=params.quantity,
                 unit=params.unit,
+                time=params.time,
             )
             try:
                 food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
@@ -3554,6 +3621,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 "food_name": food_name,
                 "quantity": params.quantity,
                 "unit": params.unit,
+                "time": params.time,
             },
             indent=2,
         )
@@ -3690,6 +3758,44 @@ async def mfp_list_meals(params: ListMealsInput) -> str:
         return json.dumps({"meals": names}, indent=2)
     except Exception as e:
         return f"Error listing meals: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_set_entry_time",
+    annotations={
+        "title": "Set a Diary Entry's Eating Time",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_set_entry_time(params: SetEntryTimeInput) -> str:
+    """
+    Set the time of day an existing food diary entry was eaten.
+
+    Changes only the entry's consumed_at (the app's time picker); amount, meal
+    and nutrition are untouched. Use it when an entry was logged without a time
+    or with the wrong one. Get the entry_id from mfp_get_food_entries.
+
+    Args:
+        params: SetEntryTimeInput containing:
+            - entry_id (str): the entry's v2 diary id (UUID)
+            - time (str): 'HH:MM', 24-hour
+
+    Returns:
+        str: Confirmation, or the error MyFitnessPal returned
+    """
+    try:
+        client = get_mfp_client()
+        await asyncio.to_thread(set_entry_time, client, params.entry_id, params.time)
+        return json.dumps(
+            {"success": True, "entry_id": params.entry_id, "time": params.time},
+            indent=2,
+        )
+    except Exception as e:
+        logger.error(f"Error setting entry time: {e}")
+        return f"Error setting entry time: {str(e)}"
 
 
 @mcp.tool(
